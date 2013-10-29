@@ -15,6 +15,7 @@ import me.prettyprint.cassandra.service.CassandraClientMonitor.Counter;
 import me.prettyprint.cassandra.service.CassandraHost;
 import me.prettyprint.hector.api.exceptions.HInactivePoolException;
 import me.prettyprint.hector.api.exceptions.HPoolExhaustedException;
+import me.prettyprint.hector.api.exceptions.HPoolRecoverableException;
 import me.prettyprint.hector.api.exceptions.HectorException;
 import me.prettyprint.hector.api.exceptions.HectorTransportException;
 
@@ -76,7 +77,7 @@ public class ConcurrentHClientPool implements HClientPool {
     }
 
     HClient cassandraClient = availableClientQueue.poll();
-    int currentActiveClients = activeClientsCount.incrementAndGet();
+    int currentActiveClients = availableClientQueue.size();
 
     try {
       if (cassandraClient != null) {
@@ -106,15 +107,20 @@ public class ConcurrentHClientPool implements HClientPool {
 
         if (currentActiveClients <= cassandraHost.getMaxActive()) {
           cassandraClient = createClient();
+          //Increment only after successful client create
+          if(null != cassandraClient){
+              activeClientsCount.incrementAndGet();        	  
+          }
         } else {
           // We can't grow so let's wait for a connection to become available.
+          log.warn("Pool for the host {} is exhausted. Avaliable Connections {} ", cassandraClient.getCassandraHost().getHost(), currentActiveClients);
           cassandraClient = waitForConnection();
         }
 
       }
 
       if ( cassandraClient == null ) {
-        throw new HectorException("HConnectionManager returned a null client after aquisition - are we shutting down?");
+        throw new HPoolRecoverableException("HConnectionManager returned a null client after aquisition - are we shutting down?");
       }
     } catch (RuntimeException e) {
       activeClientsCount.decrementAndGet();
@@ -270,29 +276,34 @@ public void releaseClient(HClient client) throws HectorException {
       client.close();
     }
     boolean open = client.isOpen();
-    if ( open ) {
-      if ( active.get() ) {
-        addClientToPoolGently(client);
-      } else {
-        log.info("Open client {} released to in-active pool for host {}. Closing.", client, cassandraHost);
-        client.close();
-      }
-    } else {
-      try {
-        addClientToPoolGently(createClient());
-      } catch (HectorTransportException e) {
-        // if unable to open client then don't add one back to the pool
-        log.error("Transport exception in re-opening client in release on {}", getName());
-      }
+    try{
+        if ( open ) {
+            if ( active.get() ) {
+              addClientToPoolGently(client);
+            } else {
+              log.info("Open client {} released to in-active pool for host {}. Closing.", client, cassandraHost);
+              client.close();
+            }
+          } else {
+            try {
+              addClientToPoolGently(createClient());
+            } catch (HectorTransportException e) {
+              // if unable to open client then don't add one back to the pool
+              log.error("Transport exception in re-opening client in release on {}", getName());
+              throw e;
+            }
+          }    	
+    }finally{
+        realActiveClientsCount.decrementAndGet();
+        exhaustedStartTime.set(-1);
+        activeClientsCount.decrementAndGet();
+
+        if ( log.isTraceEnabled() ) {
+          log.trace("Status of releaseClient {} to queue: {}", client.toString(), open);
+        }
+    	
     }
 
-    realActiveClientsCount.decrementAndGet();
-    exhaustedStartTime.set(-1);
-    activeClientsCount.decrementAndGet();
-
-    if ( log.isTraceEnabled() ) {
-      log.trace("Status of releaseClient {} to queue: {}", client.toString(), open);
-    }
   }
 
   /**
