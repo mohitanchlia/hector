@@ -76,7 +76,7 @@ public class ConcurrentHClientPool implements HClientPool {
     }
 
     HClient cassandraClient = availableClientQueue.poll();
-    int currentActiveClients = activeClientsCount.incrementAndGet();
+    int currentActiveClients = activeClientsCount.get();
 
     try {
       if (cassandraClient != null) {
@@ -114,10 +114,14 @@ public class ConcurrentHClientPool implements HClientPool {
       }
 
       if ( cassandraClient == null ) {
-        throw new HectorException("HConnectionManager returned a null client after aquisition - are we shutting down?");
+        throw new HPoolExhaustedException("HConnectionManager returned a null client after aquisition - are we shutting down?");
+      }else{
+    	  //Increment only when we successfully get a client connection
+    	  activeClientsCount.incrementAndGet();
       }
     } catch (RuntimeException e) {
-      activeClientsCount.decrementAndGet();
+       //Do we need this?
+      //activeClientsCount.decrementAndGet();
       throw e;
     }
 
@@ -133,6 +137,9 @@ public class ConcurrentHClientPool implements HClientPool {
     HClient cassandraClient = null;
     numBlocked.incrementAndGet();
 
+    int currentActiveClients = activeClientsCount.get();
+    int poolSize = availableClientQueue.size();
+
     // blocked take on the queue if we are configured to wait forever
     if ( log.isDebugEnabled() ) {
       log.debug("blocking on queue - current block count {}", numBlocked.get());
@@ -141,9 +148,13 @@ public class ConcurrentHClientPool implements HClientPool {
     try {
       // wait and catch, creating a new one if the counts have changed. Infinite wait should just recurse.
       if (maxWaitTimeWhenExhausted == 0) {
-        while (cassandraClient == null && active.get()) {
+    	  //Avoid any race condition by making sure that active clients are still working and also double check the pool size when currentACtiveClient is < 0.
+    	  //This avoids any race condition
+        while (cassandraClient == null && active.get() && (currentActiveClients > 0 || (poolSize > 0 && currentActiveClients <=0)) ) {
           try {
             cassandraClient = availableClientQueue.poll(100, TimeUnit.MILLISECONDS);
+            currentActiveClients = activeClientsCount.get();
+            poolSize = availableClientQueue.size();
           } catch (InterruptedException ie) {
             log.error("InterruptedException poll operation on retry forever", ie);
             break;
